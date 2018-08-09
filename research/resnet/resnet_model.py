@@ -42,7 +42,7 @@ tf.logging.warning("models/research/resnet is deprecated. "
 class ResNet(object):
   """ResNet model."""
 
-  def __init__(self, hps, images, labels, mode):
+  def __init__(self, hps, images, labels, mode, default_batch_norm_method='original_repo_regular'):
     """ResNet constructor.
 
     Args:
@@ -57,6 +57,7 @@ class ResNet(object):
     self.mode = mode
 
     self._extra_train_ops = []
+    self.default_batch_norm_method = default_batch_norm_method
 
   def build_graph(self):
     """Build a whole graph for the model."""
@@ -146,11 +147,40 @@ class ResNet(object):
         zip(grads, trainable_variables),
         global_step=self.global_step, name='train_step')
 
-    train_ops = [apply_op] + self._extra_train_ops
+    train_ops = [apply_op] + self._extra_train_ops + tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     self.train_op = tf.group(*train_ops)
 
+  def _batch_norm(self, name, x, batch_norm_method=None, momentum=.99):
+    if batch_norm_method is None:
+      batch_norm_method = self.default_batch_norm_method #  'original_repo_regular'
+
+    if batch_norm_method=='original_repo_regular':
+      # updates are in self._extra_train_ops
+      return self._batch_norm_original(self, name, x, momentum=momentum)
+    elif batch_norm_method=='tf_layers_regular':
+      # updates are in tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+      return tf.layers.batch_normalization(x, name=name, momentum=momentum, renorm=False)
+    elif batch_norm_method=='tf_layers_renorm':
+      # updates are in tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+      return tf.layers.batch_normalization(x, name=name, momentum=momentum, renorm=True)
+    elif batch_norm_method=='batch_free_normalization':
+      import batch_free_normalization.bfn
+      # forward updates are in tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+      # backward updates are baked in
+      with tf.variable_scope(name):
+        return batch_free_normalization.bfn.bfn_beta_gamma(x, momentum=momentum)
+    elif batch_norm_method=='batch_free_normalization_while_tracking_original':
+      import batch_free_normalization.bfn
+      # forward updates are in tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+      # backward updates are baked in
+      with tf.variable_scope(name):
+        return batch_free_normalization.bfn.bfn_beta_gamma(x, momentum=momentum)
+    else:
+      raise NotImplementedError("Unknown batch_norm_method %s" % batch_norm_method)
+
+ 
   # TODO(xpan): Consider batch_norm in contrib/layers/python/layers/layers.py
-  def _batch_norm(self, name, x):
+  def _batch_norm_original(self, name, x, momentum=.99): # was .9
     """Batch normalization."""
     with tf.variable_scope(name):
       params_shape = [x.get_shape()[-1]]
@@ -175,9 +205,9 @@ class ResNet(object):
             trainable=False)
 
         self._extra_train_ops.append(moving_averages.assign_moving_average(
-            moving_mean, mean, 0.9))
+            moving_mean, mean, momentum))
         self._extra_train_ops.append(moving_averages.assign_moving_average(
-            moving_variance, variance, 0.9))
+            moving_variance, variance, momentum))
       else:
         mean = tf.get_variable(
             'moving_mean', params_shape, tf.float32,

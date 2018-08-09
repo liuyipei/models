@@ -177,7 +177,8 @@ def learning_rate_with_decay(
 def resnet_model_fn(features, labels, mode, model_class,
                     resnet_size, weight_decay, learning_rate_fn, momentum,
                     data_format, resnet_version, loss_scale,
-                    loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE):
+                    loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE,
+                    batch_norm_method=None,):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -222,7 +223,7 @@ def resnet_model_fn(features, labels, mode, model_class,
   features = tf.cast(features, dtype)
 
   model = model_class(resnet_size, data_format, resnet_version=resnet_version,
-                      dtype=dtype)
+                      dtype=dtype, batch_norm_method=batch_norm_method)
 
   logits = model(features, mode == tf.estimator.ModeKeys.TRAIN)
 
@@ -256,7 +257,7 @@ def resnet_model_fn(features, labels, mode, model_class,
   # If no loss_filter_fn is passed, assume we want the default behavior,
   # which is that batch_normalization variables are excluded from loss.
   def exclude_batch_norm(name):
-    return 'batch_normalization' not in name
+    return ('batch_normalization' not in name) and ('bfn_running' not in name) # batch free norm
   loss_filter_fn = loss_filter_fn or exclude_batch_norm
 
   # Add weight decay to the loss.
@@ -276,12 +277,15 @@ def resnet_model_fn(features, labels, mode, model_class,
     tf.identity(learning_rate, name='learning_rate')
     tf.summary.scalar('learning_rate', learning_rate)
 
-    optimizer = tf.train.MomentumOptimizer(
-        learning_rate=learning_rate,
-        momentum=momentum
-    )
-
-    if loss_scale != 1:
+    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    #optimizer = tf.train.MomentumOptimizer(
+    #    learning_rate=learning_rate,
+    #    momentum=momentum
+    #)
+    #optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
+    print('trainable')
+    print(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES))
+    if True:#loss_scale != 1:
       # When computing fp16 gradients, often intermediate tensor values are
       # so small, they underflow to 0. To avoid this, we multiply the loss by
       # loss_scale to make these tensor values loss_scale times bigger.
@@ -291,6 +295,10 @@ def resnet_model_fn(features, labels, mode, model_class,
       # back to the correct scale before passing them to the optimizer.
       unscaled_grad_vars = [(grad / loss_scale, var)
                             for grad, var in scaled_grad_vars]
+      print(unscaled_grad_vars)
+      for i, curr_var in enumerate(unscaled_grad_vars):
+        print(i, curr_var)
+        optimizer.apply_gradients([curr_var], global_step)
       minimize_op = optimizer.apply_gradients(unscaled_grad_vars, global_step)
     else:
       minimize_op = optimizer.minimize(loss, global_step)
@@ -335,6 +343,7 @@ def resnet_main(
   """
 
   model_helpers.apply_clean(flags.FLAGS)
+  print("flags_obj.batch_size", flags_obj.batch_size)
 
   # Using the Winograd non-fused algorithms provides a small performance boost.
   os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
@@ -362,7 +371,8 @@ def resnet_main(
           'batch_size': flags_obj.batch_size,
           'resnet_version': int(flags_obj.resnet_version),
           'loss_scale': flags_core.get_loss_scale(flags_obj),
-          'dtype': flags_core.get_tf_dtype(flags_obj)
+          'dtype': flags_core.get_tf_dtype(flags_obj),
+          'batch_norm_method': flags_obj.batch_norm_method,
       })
 
   run_params = {
@@ -372,6 +382,7 @@ def resnet_main(
       'resnet_version': flags_obj.resnet_version,
       'synthetic_data': flags_obj.use_synthetic_data,
       'train_epochs': flags_obj.train_epochs,
+      'batch_norm_method': flags_obj.batch_norm_method,
   }
   if flags_obj.use_synthetic_data:
     dataset_name = dataset_name + '-synthetic'
@@ -447,6 +458,13 @@ def define_resnet_flags(resnet_size_choices=None):
       help=flags_core.help_wrap(
           'Version of ResNet. (1 or 2) See README.md for details.'))
 
+  flags.DEFINE_enum(
+      name='batch_norm_method', short_name='bnmethod', default='tf_layers_regular',
+      enum_values=[
+        'tf_layers_regular', 'tf_layers_renorm',
+        'batch_free_normalization', 'batch_free_normalization_compare_running_stats'],
+      help=flags_core.help_wrap(
+          'batch norm method string'))
   choice_kwargs = dict(
       name='resnet_size', short_name='rs', default='50',
       help=flags_core.help_wrap('The size of the ResNet model to use.'))
