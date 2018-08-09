@@ -540,7 +540,12 @@ class Model(object):
       # here because it performs better than AveragePooling2D.
       axes = [2, 3] if self.data_format == 'channels_first' else [1, 2]
       inputs = tf.reduce_mean(inputs, axes, keepdims=True)
-      inputs = tf.identity(inputs, 'final_reduce_mean')
+
+      ###
+      z = tf.Variable(0, dtype=tf.float32, trainable=True, name='tf_Variable_direct') # this fails
+      # z=tf.get_variable("tf_get_variable", [], dtype=tf.float32) this works!
+
+      inputs = tf.identity(inputs+z, 'final_reduce_mean')
 
       inputs = tf.reshape(inputs, [-1, self.final_size])
       inputs = tf.layers.dense(inputs=inputs, units=self.num_classes)
