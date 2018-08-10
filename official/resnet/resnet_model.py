@@ -81,11 +81,15 @@ def batch_norm(inputs, training, data_format, batch_norm_method=None):
     print("treat_sigma_const", treat_sigma_const)
     # backward updates are baked into the graph with control deps
     resulting_axes = [1] if data_format == 'channels_first' else [3]
+    global_step = tf.train.get_or_create_global_step()
+    s = tf.cast(global_step, dtype=tf.float32)
+    max_bfn_momentum = .9 # slowly rise to .9
+    bfn_momentum = tf.minimum(max_bfn_momentum, (s + 1.) / (s + 2.))
     retval = bfn.bfn_beta_gamma(
       inputs,
       treat_sigma_const=treat_sigma_const,
       resulting_axes=resulting_axes,
-      momentum=_BATCH_NORM_DECAY,
+      momentum=bfn_momentum,
       eps=_BATCH_NORM_EPSILON)
     if batch_norm_method.endswith('compare_running_stats'):
       with tf.variable_scope('compare_running_stats'):
