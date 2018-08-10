@@ -77,10 +77,13 @@ def batch_norm(inputs, training, data_format, batch_norm_method=None):
       renorm=True)
   elif batch_norm_method.startswith('batch_free_normalization'):
     import batch_free_normalization.python.bfn as bfn
+    treat_sigma_const = not ('_sigfunc' in batch_norm_method)
+    print("treat_sigma_const", treat_sigma_const)
     # backward updates are baked into the graph with control deps
     resulting_axes = [1] if data_format == 'channels_first' else [3]
     retval = bfn.bfn_beta_gamma(
       inputs,
+      treat_sigma_const=treat_sigma_const,
       resulting_axes=resulting_axes,
       momentum=_BATCH_NORM_DECAY,
       eps=_BATCH_NORM_EPSILON)
@@ -91,6 +94,8 @@ def batch_norm(inputs, training, data_format, batch_norm_method=None):
             momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
             scale=True, training=training, fused=True)
     return retval
+  elif batch_norm_method=='identity':
+    return tf.identity(inputs)
   else:
     raise NotImplementedError("Unknown batch_norm_method %s" % batch_norm_method)
 
@@ -211,23 +216,28 @@ def _building_block_v2(inputs, filters, training, projection_shortcut, strides,
     The output tensor of the block; shape should match inputs.
   """
   shortcut = inputs
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  with tf.variable_scope('bn0'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
   inputs = tf.nn.relu(inputs)
 
   # The projection shortcut should come after the first batch norm and ReLU
   # since it performs a 1x1 convolution.
   if projection_shortcut is not None:
-    shortcut = projection_shortcut(inputs)
+    with tf.variable_scope('proj0'):
+      shortcut = projection_shortcut(inputs)
 
-  inputs = conv2d_fixed_padding(
-      inputs=inputs, filters=filters, kernel_size=3, strides=strides,
-      data_format=data_format)
+  with tf.variable_scope('conv1'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=filters, kernel_size=3, strides=strides,
+        data_format=data_format)
 
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  with tf.variable_scope('bn1'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
   inputs = tf.nn.relu(inputs)
-  inputs = conv2d_fixed_padding(
-      inputs=inputs, filters=filters, kernel_size=3, strides=1,
-      data_format=data_format)
+  with tf.variable_scope('conv2'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=filters, kernel_size=3, strides=1,
+        data_format=data_format)
 
   return inputs + shortcut
 
@@ -379,11 +389,13 @@ def block_layer(inputs, filters, bottleneck, block_fn, blocks, strides,
         data_format=data_format)
 
   # Only the first block per block_layer uses projection_shortcut and strides
-  inputs = block_fn(inputs, filters, training, projection_shortcut, strides,
-                    data_format, batch_norm_method=batch_norm_method)
+  with tf.variable_scope('block_initial'):
+    inputs = block_fn(inputs, filters, training, projection_shortcut, strides,
+                      data_format, batch_norm_method=batch_norm_method)
 
   for _ in range(1, blocks):
-    inputs = block_fn(inputs, filters, training, None, 1, data_format, batch_norm_method=batch_norm_method)
+    with tf.variable_scope('block_fn_%0.3d' % _):
+      inputs = block_fn(inputs, filters, training, None, 1, data_format, batch_norm_method=batch_norm_method)
 
   return tf.identity(inputs, name)
 
@@ -541,10 +553,10 @@ class Model(object):
         # This provides a large performance boost on GPU. See
         # https://www.tensorflow.org/performance/performance_guide#data_formats
         inputs = tf.transpose(inputs, [0, 3, 1, 2])
-
-      inputs = conv2d_fixed_padding(
-          inputs=inputs, filters=self.num_filters, kernel_size=self.kernel_size,
-          strides=self.conv_stride, data_format=self.data_format)
+      with tf.variable_scope('initial_conv'):
+        inputs = conv2d_fixed_padding(
+            inputs=inputs, filters=self.num_filters, kernel_size=self.kernel_size,
+            strides=self.conv_stride, data_format=self.data_format)
       inputs = tf.identity(inputs, 'initial_conv')
 
       # We do not include batch normalization or activation functions in V2
@@ -552,7 +564,8 @@ class Model(object):
       # for both the shortcut and non-shortcut paths as part of the first
       # block's projection. Cf. Appendix of [2].
       if self.resnet_version == 1:
-        inputs = batch_norm(inputs, training, self.data_format, batch_norm_method=self.batch_norm_method)
+        with tf.variable_scope('initial_bn'):
+          inputs = batch_norm(inputs, training, self.data_format, batch_norm_method=self.batch_norm_method)
         inputs = tf.nn.relu(inputs)
 
       if self.first_pool_size:
@@ -564,17 +577,19 @@ class Model(object):
 
       for i, num_blocks in enumerate(self.block_sizes):
         num_filters = self.num_filters * (2**i)
-        inputs = block_layer(
-            inputs=inputs, filters=num_filters, bottleneck=self.bottleneck,
-            block_fn=self.block_fn, blocks=num_blocks,
-            strides=self.block_strides[i], training=training,
-            name='block_layer{}'.format(i + 1), data_format=self.data_format,
-            batch_norm_method=self.batch_norm_method)
+        with tf.variable_scope('block_layer_%0.2d' % (i + 1)):
+          inputs = block_layer(
+              inputs=inputs, filters=num_filters, bottleneck=self.bottleneck,
+              block_fn=self.block_fn, blocks=num_blocks,
+              strides=self.block_strides[i], training=training,
+              name='block_layer_%0.2d' % (i + 1), data_format=self.data_format,
+              batch_norm_method=self.batch_norm_method)
 
       # Only apply the BN and ReLU for model that does pre_activation in each
       # building/bottleneck block, eg resnet V2.
       if self.pre_activation:
-        inputs = batch_norm(inputs, training, self.data_format, batch_norm_method=self.batch_norm_method)
+        with tf.variable_scope('preactivation_bn'):
+          inputs = batch_norm(inputs, training, self.data_format, batch_norm_method=self.batch_norm_method)
         inputs = tf.nn.relu(inputs)
 
       # The current top layer has shape
@@ -589,8 +604,5 @@ class Model(object):
       inputs = tf.reshape(inputs, [-1, self.final_size])
       inputs = tf.layers.dense(inputs=inputs, units=self.num_classes)
       
-      #z = tf.Variable(0, dtype=tf.float32, trainable=True, name='tf_Variable_direct')
-      z=tf.get_variable("tf_get_variable", [], dtype=tf.float32)
-      
-      inputs = tf.identity(inputs + z, 'final_dense')
+      inputs = tf.identity(inputs, 'final_dense')
       return inputs

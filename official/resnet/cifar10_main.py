@@ -219,7 +219,7 @@ def cifar10_model_fn(features, labels, mode, params):
       resnet_size=params['resnet_size'],
       weight_decay=weight_decay,
       learning_rate_fn=learning_rate_fn,
-      momentum=0.9,
+      momentum=0.0, # 0.9,
       data_format=params['data_format'],
       resnet_version=params['resnet_version'],
       loss_scale=params['loss_scale'],
@@ -236,7 +236,7 @@ def define_cifar_flags():
                           model_dir='/tmp/cifar10_model',
                           resnet_size='32',
                           train_epochs=250,
-                          epochs_between_evals=10,
+                          epochs_between_evals=5,#10,
                           batch_size=128)
 
 

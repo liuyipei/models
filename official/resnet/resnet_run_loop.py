@@ -63,6 +63,11 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
   Returns:
     Dataset of (image, label) pairs ready for iteration.
   """
+  print("process_record_dataset batch_size", batch_size)
+  print("process_record_dataset shuffle_buffer", shuffle_buffer)
+  print("process_record_dataset num_epochs", num_epochs)
+  print("process_record_dataset num_gpus", num_gpus)
+  print("process_record_dataset examples_per_epoch", examples_per_epoch)
 
   # We prefetch a batch at a time, This can help smooth out the time taken to
   # load input files as we go through shuffling and processing.
@@ -277,15 +282,15 @@ def resnet_model_fn(features, labels, mode, model_class,
     tf.identity(learning_rate, name='learning_rate')
     tf.summary.scalar('learning_rate', learning_rate)
 
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-    #optimizer = tf.train.MomentumOptimizer(
-    #    learning_rate=learning_rate,
-    #    momentum=momentum
-    #)
+    #optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    optimizer = tf.train.MomentumOptimizer(
+        learning_rate=learning_rate,
+        momentum=momentum
+    )
     #optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
-    print('trainable')
-    print(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES))
-    if True:#loss_scale != 1:
+    #print('trainable')
+    #print(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES))
+    if loss_scale != 1:
       # When computing fp16 gradients, often intermediate tensor values are
       # so small, they underflow to 0. To avoid this, we multiply the loss by
       # loss_scale to make these tensor values loss_scale times bigger.
@@ -309,8 +314,8 @@ def resnet_model_fn(features, labels, mode, model_class,
     train_op = None
 
   accuracy = tf.metrics.accuracy(labels, predictions['classes'])
-
-  metrics = {'accuracy': accuracy}
+  metrics = {'accuracy': accuracy,
+             'cross_entropy': tf.metrics.mean(cross_entropy)}
 
   # Create a tensor named train_accuracy for logging purposes
   tf.identity(accuracy[1], name='train_accuracy')
@@ -462,7 +467,11 @@ def define_resnet_flags(resnet_size_choices=None):
       name='batch_norm_method', short_name='bnmethod', default='tf_layers_regular',
       enum_values=[
         'tf_layers_regular', 'tf_layers_renorm',
-        'batch_free_normalization', 'batch_free_normalization_compare_running_stats'],
+        'batch_free_normalization',
+        'batch_free_normalization_compare_running_stats',
+        'batch_free_normalization_sigfunc',
+        'identity',
+        ],
       help=flags_core.help_wrap(
           'batch norm method string'))
   choice_kwargs = dict(
