@@ -209,7 +209,8 @@ class ImagenetModel(resnet_model.Model):
 
   def __init__(self, resnet_size, data_format=None, num_classes=_NUM_CLASSES,
                resnet_version=resnet_model.DEFAULT_VERSION,
-               dtype=resnet_model.DEFAULT_DTYPE):
+               dtype=resnet_model.DEFAULT_DTYPE,
+               batch_norm_dict=None):
     """These are the parameters that work for Imagenet data.
 
     Args:
@@ -245,7 +246,8 @@ class ImagenetModel(resnet_model.Model):
         final_size=final_size,
         resnet_version=resnet_version,
         data_format=data_format,
-        dtype=dtype
+        dtype=dtype,
+        batch_norm_dict=batch_norm_dict,
     )
 
 
@@ -285,9 +287,10 @@ def _get_block_sizes(resnet_size):
 
 def imagenet_model_fn(features, labels, mode, params):
   """Our model_fn for ResNet to be used with our Estimator."""
+  boundary_epochs = [int(params.get('bepm', 1.) * _) for _ in [30, 60, 80, 90]]
   learning_rate_fn = resnet_run_loop.learning_rate_with_decay(
-      batch_size=params['batch_size'], batch_denom=256,
-      num_images=_NUM_IMAGES['train'], boundary_epochs=[30, 60, 80, 90],
+      batch_size=params['batch_size'], batch_denom=params.get('batch_denom', None) or 256.,
+      num_images=_NUM_IMAGES['train'], boundary_epochs=boundary_epochs,
       decay_rates=[1, 0.1, 0.01, 0.001, 1e-4])
 
   return resnet_run_loop.resnet_model_fn(
@@ -298,12 +301,20 @@ def imagenet_model_fn(features, labels, mode, params):
       resnet_size=params['resnet_size'],
       weight_decay=1e-4,
       learning_rate_fn=learning_rate_fn,
-      momentum=0.9,
+      momentum=params.get('opt_mm', 0.9),
       data_format=params['data_format'],
       resnet_version=params['resnet_version'],
       loss_scale=params['loss_scale'],
       loss_filter_fn=None,
-      dtype=params['dtype']
+      dtype=params['dtype'],
+      batch_norm_dict=dict(
+        batch_norm_method=params['batch_norm_method'],
+        bfn_mmfwd=params['bfn_mmfwd'],
+        bfn_mmgrad=params['bfn_mmgrad'],
+        bfn_grad_clip=params['bfn_grad_clip'],
+        rvst=params['rvst'],
+        vd_weights=params['vd_weights'],
+      )
   )
 
 

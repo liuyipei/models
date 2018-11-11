@@ -149,7 +149,8 @@ class Cifar10Model(resnet_model.Model):
   def __init__(self, resnet_size, data_format=None, num_classes=_NUM_CLASSES,
                resnet_version=resnet_model.DEFAULT_VERSION,
                dtype=resnet_model.DEFAULT_DTYPE,
-               batch_norm_method=None,
+               batch_norm_dict=None,
+               batch_denom=None,
                ):
     """These are the parameters that work for CIFAR-10 data.
 
@@ -186,7 +187,7 @@ class Cifar10Model(resnet_model.Model):
         resnet_version=resnet_version,
         data_format=data_format,
         dtype=dtype,
-        batch_norm_method=batch_norm_method
+        batch_norm_dict=batch_norm_dict
     )
 
 
@@ -194,9 +195,11 @@ def cifar10_model_fn(features, labels, mode, params):
   """Model function for CIFAR-10."""
   features = tf.reshape(features, [-1, _HEIGHT, _WIDTH, _NUM_CHANNELS])
 
+  boundary_epochs = [int(params.get('bepm', 1) * _) for _ in [100, 150, 200]]
+  print(boundary_epochs)
   learning_rate_fn = resnet_run_loop.learning_rate_with_decay(
-      batch_size=params['batch_size'], batch_denom=128,
-      num_images=_NUM_IMAGES['train'], boundary_epochs=[100, 150, 200],
+      batch_size=params['batch_size'], batch_denom=params.get('batch_denom', None) or 128,
+      num_images=_NUM_IMAGES['train'], boundary_epochs=boundary_epochs,
       decay_rates=[1, 0.1, 0.01, 0.001])
 
   # We use a weight decay of 0.0002, which performs better
@@ -219,13 +222,21 @@ def cifar10_model_fn(features, labels, mode, params):
       resnet_size=params['resnet_size'],
       weight_decay=weight_decay,
       learning_rate_fn=learning_rate_fn,
-      momentum=0.0, # 0.9,
+      momentum=params.get('opt_mm', .9), # was .0 for some private early experiments
       data_format=params['data_format'],
       resnet_version=params['resnet_version'],
       loss_scale=params['loss_scale'],
-      loss_filter_fn=loss_filter_fn,
+      loss_filter_fn=None, # loss_filter_fn, # reverting to original settings for easier exposition
       dtype=params['dtype'],
-      batch_norm_method=params['batch_norm_method']
+      batch_norm_dict=dict(
+        batch_norm_method=params['batch_norm_method'],
+        bfn_mmfwd=params['bfn_mmfwd'],
+        bfn_mmgrad=params['bfn_mmgrad'],
+        bfn_grad_clip=params['bfn_grad_clip'],
+        rvst=params['rvst'],
+        bfn_input_decay=params['bfn_input_decay'],
+        vd_weights=params['vd_weights'],
+      ),
   )
 
 

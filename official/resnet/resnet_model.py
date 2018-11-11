@@ -58,46 +58,216 @@ def old_batch_norm(inputs, training, data_format):
       momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
       scale=True, training=training, fused=True)
 
+def moment_normalize(x, axes, eps, **kwargs):
+  u, v = tf.nn.moments(x, axes, keep_dims=True, **kwargs)
+  return (x - u) * tf.rsqrt(v + eps)
 
-def batch_norm(inputs, training, data_format, batch_norm_method=None):
-  if batch_norm_method is None:
+def group_norm(x, G, eps=1e-5): # group_norm(x, gamma, beta, G, eps=1e−5):
+  # x: input features with shape [N,C,H,W]
+  # gamma, beta: scale and offset, with shape [1,C,1,1]
+  # G: number of groups for GN
+  # https://arxiv.org/pdf/1803.08494.pdf
+  N, C, H, W = x.get_shape().as_list()
+  N = -1
+  print([N, C, H, W])
+  x = tf.reshape(x, [N, G, C // G, H, W])
+  mean, var = tf.nn.moments(x, [2, 3, 4], keep_dims=True)
+  x = (x - mean) / tf.sqrt(var + eps)
+  x = tf.reshape(x, [N, C, H, W])
+  return x
+
+def batch_norm(inputs, training, data_format, batch_norm_dict=None):
+  import batch_free_normalization.python.regularized_bn as regularized_bn
+  # batch_norm_method=None, bfn_mmfwd=None, bfn_mmgrad=None
+  print(batch_norm_dict)
+  if batch_norm_dict is None:
     batch_norm_method = _BATCH_NORM_DEFAULT_METHOD
-    print('batch_norm_method', batch_norm_method)
+  else:
+    batch_norm_method = batch_norm_dict['batch_norm_method']
+  print('batch_norm_method', batch_norm_method)
 
   if batch_norm_method=='tf_layers_regular':
     return tf.layers.batch_normalization(
       inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
       momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
-      scale=True, training=training, fused=True)
+      scale=True, training=training, fused=True,
+      renorm=False)
+  if batch_norm_method.startswith('tf_sequence'):
+    shape = tf.shape(inputs)
+    stshp = inputs.get_shape().as_list() # stshp stands for static shape; may contain Nones;
+    for _ in stshp[1:]:
+      assert _ is not None
+    channel_axis = 1 if data_format == 'channels_first' else 3
+    batch_axis = 0
+    seq_string = batch_norm_method.split('_')[-1].upper()
+    one = tf.ones(shape=[], dtype=tf.int32)
+    # CuDNN has constraints on batch size (dim 0) -- can't be too large -- hence different patterning for 0 and 1
+    dict_reshape = {  # dim 1 is the accumulator dimension in tf.layers.batch_normalization
+      '0': tf.stack([shape[0],                                  one,                 shape[1], shape[2] * shape[3]]), # accumulate ...
+      '2': tf.stack([shape[0] * shape[1],                       shape[2],            one, shape[3]]),         # accumulate .H.
+      '3': tf.stack([shape[0] * shape[1],                       shape[2] * shape[3], one, one]),     # accumulate .HW
+      '6': tf.stack([shape[0],                                  shape[1] * shape[2], one, shape[3]]),         # accumulate CH.
+      # 4: C..  standard batch normalization
+      # 1: ..W. batch size too large for cudnn to handle: special case  -- transpose into 2
+      # 5: C.W  discontiguous accumulator dims: special case  -- transpose into 6
+      # 7: ...  cannot normalize.
+    }
+
+    dict_stshp = {  # dim 1 is the accumulator dimension in tf.layers.batch_normalization
+        '0': [None, 1,                   stshp[1], stshp[2] * stshp[3]],# accumulate ...
+        '2': [None, stshp[2],            1, stshp[3]],                  # accumulate .H.
+        '3': [None, stshp[2] * stshp[3], 1, 1],                         # accumulate .HW
+        '6': [None, stshp[1] * stshp[2], 1, stshp[3]]                   # accumulate CH.
+        # 4: C..  standard batch normalization
+        # 1,5; transpose into BCWC and reduce to 2,6 respectively. CuDNN batch size constraint; incontiguous accumulator rank indices  
+        # 7: ...  cannot normalize.
+    }
+    
+    def partition_normalization(s, inputs):
+      assert channel_axis == 1
+      if s != '4': # 4 means standard BN (without affine downstream here)
+        inputs = tf.reshape(inputs, dict_reshape[s]) # no transpose necessary
+        inputs.set_shape(dict_stshp[s])
+      inputs = tf.layers.batch_normalization(
+        inputs=inputs, axis=channel_axis,
+        momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=False,
+        scale=False, training=training, fused=True,
+        renorm=False)
+      if s != '4':
+        inputs = tf.reshape(inputs, shape)
+      return inputs
+
+    for i, s in enumerate(seq_string):
+      if s == 'B':
+        inputs = tf.layers.batch_normalization(
+          inputs=inputs, axis=channel_axis,
+          momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=False,
+          scale=False, training=training, fused=True,
+          renorm=False)
+      elif s == 'L':
+        inputs = moment_normalize(inputs, axes=sorted(set(range(4)) - set([batch_axis])), eps=_BATCH_NORM_EPSILON)
+      elif s == 'I':
+        inputs = moment_normalize(inputs, axes=sorted(set(range(4)) - set([batch_axis, channel_axis])), eps=_BATCH_NORM_EPSILON)
+      elif s == 'G':
+        assert channel_axis == 1
+        inputs = group_norm(inputs, G=8, eps=_BATCH_NORM_EPSILON) # some layers have 16 channels
+      elif s in '0236': 
+        # imagine accumulator shapes as big endian flags for CHW respectively -- interpret in binary
+        with tf.variable_scope('accum%s' % s):
+          inputs = partition_normalization(s, inputs)
+      elif s in '15': # accumulator of shape C.W ( big endian CHW accumulator status in binary = 5)
+                      # special case because accumulator dimension is not contiguous -- needs transpose
+                      # also for accumulator ..W -- batch size would be too large using the 01236 method
+        with tf.variable_scope('accum%s' % s):
+          swap_H_and_W = [0, 1, 3, 2]
+          inputs = tf.transpose(inputs, swap_H_and_W) # B, C, W, H
+          if s == '1': # accumulate ..W
+            inputs = partition_normalization('2', inputs)
+          elif s == '5': # accumulate C.W
+            inputs = partition_normalization('6', inputs)
+          else:
+            raise ValueError('s=%s. not in [15]' %s)
+          inputs = tf.transpose(inputs, swap_H_and_W) # invert back
+      else:
+        raise ValueError('Unknown batch normalization seqstring character', s)
+    out = regularized_bn.beta_gamma(inputs, resulting_axes=[channel_axis])
+    return out
   elif batch_norm_method=='tf_layers_renorm':
     return tf.layers.batch_normalization(
       inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
       momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
       scale=True, training=training, fused=True,
       renorm=True)
-  elif batch_norm_method.startswith('batch_free_normalization'):
+  elif batch_norm_method.startswith('batch_free_normalization') or batch_norm_method.startswith('bfn_like_'):
     import batch_free_normalization.python.bfn as bfn
     treat_sigma_const = not ('_sigfunc' in batch_norm_method)
     print("treat_sigma_const", treat_sigma_const)
     # backward updates are baked into the graph with control deps
     resulting_axes = [1] if data_format == 'channels_first' else [3]
     global_step = tf.train.get_or_create_global_step()
-    s = tf.cast(global_step, dtype=tf.float32)
-    max_bfn_momentum = .9 # slowly rise to .9
-    bfn_momentum = tf.minimum(max_bfn_momentum, (s + 1.) / (s + 2.))
+    s = tf.cast(global_step, dtype=tf.float64)
+    raw_momentum = (s + 1.) / (s + 2.)
+    rvst = batch_norm_dict.get('rvst', None)
+    rvs = None if rvst is None else (batch_norm_dict['rvst'], batch_norm_dict.get('rvsv', None))
+    bfn_input_decay_losses = tf.reduce_mean(inputs ** 2)
+    tf.add_to_collection(name='bfn_input_decay_losses', value=bfn_input_decay_losses)
+
+    ivar_type_convergence=None
+    if "ivtc_batch" in batch_norm_method:
+      ivar_type_convergence='batch' # deault
+    elif "ivtc_loo" in batch_norm_method:
+      ivar_type_convergence='loo' # only compatible with bfn_like_loo
+    elif "ivtc_running" in batch_norm_method:
+      ivar_type_convergence='running'
+    loo_axis=None
+    
+    if batch_norm_method.startswith('bfn_like_regular'): # no ramp
+      use_inf_accum = True
+      eps = _BATCH_NORM_EPSILON
+      momentum = batch_norm_dict['bfn_mmfwd']
+      grad_momentum = batch_norm_dict['bfn_mmgrad']
+    elif batch_norm_method.startswith('bfn_like_loo'):
+      use_inf_accum = True
+      eps = _BATCH_NORM_EPSILON
+      momentum = batch_norm_dict['bfn_mmfwd']
+      grad_momentum = batch_norm_dict['bfn_mmgrad']
+      loo_axis=0
+    else:
+      # older batch_free_normalization formulation
+      use_inf_accum = False 
+      eps = 1e-3
+      momentum=tf.minimum(raw_momentum, batch_norm_dict['bfn_mmfwd'])
+      grad_momentum=tf.minimum(raw_momentum, batch_norm_dict['bfn_mmgrad'])
     retval = bfn.bfn_beta_gamma(
       inputs,
       treat_sigma_const=treat_sigma_const,
       resulting_axes=resulting_axes,
-      momentum=bfn_momentum,
-      eps=_BATCH_NORM_EPSILON)
+      momentum=momentum,
+      grad_momentum=grad_momentum,
+      eps=eps,
+      grad_clip=batch_norm_dict.get('bfn_grad_clip', None),
+      random_variance_scaling=rvs,
+      training=training,
+      use_inf_accum=use_inf_accum,
+      loo_axis=loo_axis,
+      ivar_type_convergence=ivar_type_convergence)
     if batch_norm_method.endswith('compare_running_stats'):
       with tf.variable_scope('compare_running_stats'):
-        make_baseline_accumulators_as_side_effect = tf.layers.batch_normalization(
-            inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
-            momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
-            scale=True, training=training, fused=True)
+        #make_baseline_accumulators_as_side_effect = \
+        tf.layers.batch_normalization(
+          inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
+          momentum=_BATCH_NORM_DECAY, epsilon=eps, center=True,
+          scale=True, training=training, fused=True)
     return retval
+  elif batch_norm_method.startswith('batch_free_direct'):
+    import batch_free_normalization.python.bfn_direct as bfn_direct
+    resulting_axes = [1] if data_format == 'channels_first' else [3]
+    global_step = tf.train.get_or_create_global_step()
+    s = tf.cast(global_step, dtype=tf.float64)
+    raw_momentum = (s + 1.) / (s + 2.)
+
+    retval = bfn_direct.bfnd_beta_gamma(
+      inputs,
+      resulting_axes=resulting_axes,
+      momentum=tf.minimum(raw_momentum, batch_norm_dict['bfn_mmfwd']),
+      eps=_BATCH_NORM_EPSILON,
+      training=training)
+    return retval
+  elif batch_norm_method.startswith('regularized_bn'):
+    resulting_axes = [1] if data_format == 'channels_first' else [3]
+    momentum = batch_norm_dict['bfn_mmfwd']
+    grad_momentum = batch_norm_dict['bfn_mmgrad']
+    vd_weights = batch_norm_dict.get('vd_weights', None)
+    zero_virtual_grad = (batch_norm_method == 'regularized_bn_zero')
+    y, running_stats, updates_dict = regularized_bn.regularized_batch_norm(
+      inputs, resulting_axes=resulting_axes,
+      momentum=momentum, grad_momentum=grad_momentum,
+      eps=_BATCH_NORM_EPSILON,
+      virtual_data_weights=vd_weights, training=training,
+      zero_virtual_grad=zero_virtual_grad)
+    y2 = regularized_bn.beta_gamma(y, resulting_axes=resulting_axes)
+    return y2
+    # add to collections need ot happen after optimizer is made
   elif batch_norm_method=='identity':
     return tf.identity(inputs)
   else:
@@ -149,7 +319,7 @@ def conv2d_fixed_padding(inputs, filters, kernel_size, strides, data_format):
 # ResNet block definitions.
 ################################################################################
 def _building_block_v1(inputs, filters, training, projection_shortcut, strides,
-                       data_format, batch_norm_method=None):
+                       data_format, batch_norm_dict=None):
   """A single block for ResNet v1, without a bottleneck.
 
   Convolution then batch normalization then ReLU as described by:
@@ -177,18 +347,18 @@ def _building_block_v1(inputs, filters, training, projection_shortcut, strides,
   if projection_shortcut is not None:
     shortcut = projection_shortcut(inputs)
     shortcut = batch_norm(inputs=shortcut, training=training,
-                          data_format=data_format, batch_norm_method=batch_norm_method)
+                          data_format=data_format, batch_norm_dict=batch_norm_dict)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs = tf.nn.relu(inputs)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=1,
       data_format=data_format)
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs += shortcut
   inputs = tf.nn.relu(inputs)
 
@@ -196,7 +366,7 @@ def _building_block_v1(inputs, filters, training, projection_shortcut, strides,
 
 
 def _building_block_v2(inputs, filters, training, projection_shortcut, strides,
-                       data_format, batch_norm_method=None):
+                       data_format, batch_norm_dict=None):
   """A single block for ResNet v2, without a bottleneck.
 
   Batch normalization then ReLu then convolution as described by:
@@ -221,7 +391,7 @@ def _building_block_v2(inputs, filters, training, projection_shortcut, strides,
   """
   shortcut = inputs
   with tf.variable_scope('bn0'):
-    inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs = tf.nn.relu(inputs)
 
   # The projection shortcut should come after the first batch norm and ReLU
@@ -236,7 +406,7 @@ def _building_block_v2(inputs, filters, training, projection_shortcut, strides,
         data_format=data_format)
 
   with tf.variable_scope('bn1'):
-    inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs = tf.nn.relu(inputs)
   with tf.variable_scope('conv2'):
     inputs = conv2d_fixed_padding(
@@ -247,7 +417,7 @@ def _building_block_v2(inputs, filters, training, projection_shortcut, strides,
 
 
 def _bottleneck_block_v1(inputs, filters, training, projection_shortcut,
-                         strides, data_format, batch_norm_method=None):
+                         strides, data_format, batch_norm_dict=None):
   """A single block for ResNet v1, with a bottleneck.
 
   Similar to _building_block_v1(), except using the "bottleneck" blocks
@@ -277,24 +447,24 @@ def _bottleneck_block_v1(inputs, filters, training, projection_shortcut,
   if projection_shortcut is not None:
     shortcut = projection_shortcut(inputs)
     shortcut = batch_norm(inputs=shortcut, training=training,
-                          data_format=data_format, batch_norm_method=batch_norm_method)
+                          data_format=data_format, batch_norm_dict=batch_norm_dict)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=1, strides=1,
       data_format=data_format)
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs = tf.nn.relu(inputs)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=filters, kernel_size=3, strides=strides,
       data_format=data_format)
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs = tf.nn.relu(inputs)
 
   inputs = conv2d_fixed_padding(
       inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
       data_format=data_format)
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
+  inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
   inputs += shortcut
   inputs = tf.nn.relu(inputs)
 
@@ -302,7 +472,7 @@ def _bottleneck_block_v1(inputs, filters, training, projection_shortcut,
 
 
 def _bottleneck_block_v2(inputs, filters, training, projection_shortcut,
-                         strides, data_format, batch_norm_method=None):
+                         strides, data_format, batch_norm_dict=None):
   """A single block for ResNet v2, without a bottleneck.
 
   Similar to _building_block_v2(), except using the "bottleneck" blocks
@@ -334,35 +504,40 @@ def _bottleneck_block_v2(inputs, filters, training, projection_shortcut,
     The output tensor of the block; shape should match inputs.
   """
   shortcut = inputs
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
-  inputs = tf.nn.relu(inputs)
+  with tf.variable_scope('bottleblock_initial'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
+    inputs = tf.nn.relu(inputs)
 
   # The projection shortcut should come after the first batch norm and ReLU
   # since it performs a 1x1 convolution.
   if projection_shortcut is not None:
     shortcut = projection_shortcut(inputs)
 
-  inputs = conv2d_fixed_padding(
-      inputs=inputs, filters=filters, kernel_size=1, strides=1,
-      data_format=data_format)
+  with tf.variable_scope('bottleblock_conv1'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=filters, kernel_size=1, strides=1,
+        data_format=data_format)
+  with tf.variable_scope('bottleblock_bn1'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
+    inputs = tf.nn.relu(inputs)
+  with tf.variable_scope('bottleblock_conv2'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=filters, kernel_size=3, strides=strides,
+        data_format=data_format)
 
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
-  inputs = tf.nn.relu(inputs)
-  inputs = conv2d_fixed_padding(
-      inputs=inputs, filters=filters, kernel_size=3, strides=strides,
-      data_format=data_format)
-
-  inputs = batch_norm(inputs, training, data_format, batch_norm_method=batch_norm_method)
-  inputs = tf.nn.relu(inputs)
-  inputs = conv2d_fixed_padding(
-      inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
-      data_format=data_format)
+  with tf.variable_scope('bottleblock_bn2'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
+    inputs = tf.nn.relu(inputs)
+  with tf.variable_scope('bottleblock_conv3'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
+        data_format=data_format)
 
   return inputs + shortcut
 
 
 def block_layer(inputs, filters, bottleneck, block_fn, blocks, strides,
-                training, name, data_format, batch_norm_method=None):
+                training, name, data_format, batch_norm_dict=None):
   """Creates one layer of blocks for the ResNet model.
 
   Args:
@@ -395,11 +570,12 @@ def block_layer(inputs, filters, bottleneck, block_fn, blocks, strides,
   # Only the first block per block_layer uses projection_shortcut and strides
   with tf.variable_scope('block_initial'):
     inputs = block_fn(inputs, filters, training, projection_shortcut, strides,
-                      data_format, batch_norm_method=batch_norm_method)
+                      data_format, batch_norm_dict=batch_norm_dict)
 
   for _ in range(1, blocks):
     with tf.variable_scope('block_fn_%0.3d' % _):
-      inputs = block_fn(inputs, filters, training, None, 1, data_format, batch_norm_method=batch_norm_method)
+      inputs = block_fn(inputs, filters, training, None, 1, data_format,
+                        batch_norm_dict=batch_norm_dict)
 
   return tf.identity(inputs, name)
 
@@ -413,7 +589,7 @@ class Model(object):
                block_sizes, block_strides,
                final_size, resnet_version=DEFAULT_VERSION, data_format=None,
                dtype=DEFAULT_DTYPE,
-               batch_norm_method=None):
+               batch_norm_dict=None):
     """Creates a model for classifying an image.
 
     Args:
@@ -483,7 +659,7 @@ class Model(object):
     self.final_size = final_size
     self.dtype = dtype
     self.pre_activation = resnet_version == 2
-    self.batch_norm_method = batch_norm_method
+    self.batch_norm_dict = batch_norm_dict
 
   def _custom_dtype_getter(self, getter, name, shape=None, dtype=DEFAULT_DTYPE,
                            *args, **kwargs):
@@ -569,7 +745,7 @@ class Model(object):
       # block's projection. Cf. Appendix of [2].
       if self.resnet_version == 1:
         with tf.variable_scope('initial_bn'):
-          inputs = batch_norm(inputs, training, self.data_format, batch_norm_method=self.batch_norm_method)
+          inputs = batch_norm(inputs, training, self.data_format, batch_norm_dict=self.batch_norm_dict)
         inputs = tf.nn.relu(inputs)
 
       if self.first_pool_size:
@@ -587,13 +763,13 @@ class Model(object):
               block_fn=self.block_fn, blocks=num_blocks,
               strides=self.block_strides[i], training=training,
               name='block_layer_%0.2d' % (i + 1), data_format=self.data_format,
-              batch_norm_method=self.batch_norm_method)
+              batch_norm_dict=self.batch_norm_dict)
 
       # Only apply the BN and ReLU for model that does pre_activation in each
       # building/bottleneck block, eg resnet V2.
       if self.pre_activation:
         with tf.variable_scope('preactivation_bn'):
-          inputs = batch_norm(inputs, training, self.data_format, batch_norm_method=self.batch_norm_method)
+          inputs = batch_norm(inputs, training, self.data_format,batch_norm_dict=self.batch_norm_dict)
         inputs = tf.nn.relu(inputs)
 
       # The current top layer has shape

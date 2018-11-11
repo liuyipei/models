@@ -24,7 +24,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-
+import re
 # pylint: disable=g-bad-import-order
 from absl import flags
 import tensorflow as tf
@@ -183,7 +183,7 @@ def resnet_model_fn(features, labels, mode, model_class,
                     resnet_size, weight_decay, learning_rate_fn, momentum,
                     data_format, resnet_version, loss_scale,
                     loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE,
-                    batch_norm_method=None,):
+                    batch_norm_dict=None):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -228,7 +228,7 @@ def resnet_model_fn(features, labels, mode, model_class,
   features = tf.cast(features, dtype)
 
   model = model_class(resnet_size, data_format, resnet_version=resnet_version,
-                      dtype=dtype, batch_norm_method=batch_norm_method)
+                      dtype=dtype, batch_norm_dict=batch_norm_dict)
 
   logits = model(features, mode == tf.estimator.ModeKeys.TRAIN)
 
@@ -252,12 +252,17 @@ def resnet_model_fn(features, labels, mode, model_class,
         })
 
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
-  cross_entropy = tf.losses.sparse_softmax_cross_entropy(
-      logits=logits, labels=labels)
+  ce_batch_subset = batch_norm_dict.get('ce_batch_subset', None)
+  if ce_batch_subset is None:
+    cross_entropy = tf.losses.sparse_softmax_cross_entropy(
+        logits=logits, labels=labels)
+  else:
+    cross_entropy = tf.losses.sparse_softmax_cross_entropy(
+        logits=logits[:ce_batch_subset], labels=labels[:ce_batch_subset])
 
   # Create a tensor named cross_entropy for logging purposes.
   tf.identity(cross_entropy, name='cross_entropy')
-  tf.summary.scalar('cross_entropy', cross_entropy)
+  tf.summary.scalar('train_cross_entropy', cross_entropy)
 
   # If no loss_filter_fn is passed, assume we want the default behavior,
   # which is that batch_normalization variables are excluded from loss.
@@ -267,66 +272,91 @@ def resnet_model_fn(features, labels, mode, model_class,
 
   # Add weight decay to the loss.
   l2_loss = weight_decay * tf.add_n(
-      # loss is computed using fp32 for numerical stability.
-      [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables()
-       if loss_filter_fn(v.name)])
+    # loss is computed using fp32 for numerical stability.
+    [tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.trainable_variables()
+     if loss_filter_fn(v.name)])
   tf.summary.scalar('l2_loss', l2_loss)
   loss = cross_entropy + l2_loss
+
+  if batch_norm_dict is not None:  # also regularize inputs
+    bfn_input_decay = batch_norm_dict.get('bfn_input_decay', None)
+    if bfn_input_decay is not None and bfn_input_decay > 0:
+      bfn_input_decay_losses = tf.get_collection('bfn_input_decay_losses')
+      bfnd_input_decay_losses = tf.get_collection('bfnd_inputs_decay_losses')
+      inputs_decay_losses = bfn_input_decay_losses + bfnd_input_decay_losses
+      print(' %d + %d input_decay_losses' % (len(bfn_input_decay_losses), len(bfnd_input_decay_losses)), 
+          [n.name for n in bfn_input_decay_losses])
+      l2_bfn_loss = bfn_input_decay * tf.add_n([tf.reduce_mean(_) for _ in inputs_decay_losses])
+      tf.summary.scalar('l2_bfn_loss', l2_bfn_loss)
+      loss += l2_bfn_loss
 
   if mode == tf.estimator.ModeKeys.TRAIN:
     global_step = tf.train.get_or_create_global_step()
 
     learning_rate = learning_rate_fn(global_step)
-
     # Create a tensor named learning_rate for logging purposes
-    tf.identity(learning_rate, name='learning_rate')
-    tf.summary.scalar('learning_rate', learning_rate)
+    learning_rate = tf.identity(learning_rate, name='learning_rate')
+    log10_learning_rate = tf.identity(tf.log(learning_rate) / tf.log(10.), name='log10_learning_rate')
+    tf.summary.scalar('log10_learning_rate', log10_learning_rate)
+    all_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+    for v in all_variables:
+      v_abs = tf.cast(tf.abs(v), dtype=tf.float32) + tf.constant(1e-6, dtype=tf.float32)
+      rep_name = re.sub(':', '_', v.name)
+      if 'variance' in rep_name:
+        v_minlogabs = tf.reduce_min(tf.log(v_abs))
+        tf.summary.scalar('.'.join(['minlogabs_variance/', rep_name]), v_minlogabs)
+      elif 'ygrad' in rep_name:
+        v_maxlogabs = tf.reduce_max(tf.log(v_abs))
+        tf.summary.scalar('.'.join(['maxlogabs_ygrads/', rep_name]), v_maxlogabs)
+      else:
+        continue
 
-    #optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    # optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
     optimizer = tf.train.MomentumOptimizer(
         learning_rate=learning_rate,
         momentum=momentum
     )
-    #optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
-    #print('trainable')
-    #print(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES))
-    if loss_scale != 1:
-      # When computing fp16 gradients, often intermediate tensor values are
-      # so small, they underflow to 0. To avoid this, we multiply the loss by
-      # loss_scale to make these tensor values loss_scale times bigger.
-      scaled_grad_vars = optimizer.compute_gradients(loss * loss_scale)
 
-      # Once the gradient computation is complete we can scale the gradients
-      # back to the correct scale before passing them to the optimizer.
-      unscaled_grad_vars = [(grad / loss_scale, var)
-                            for grad, var in scaled_grad_vars]
-      print(unscaled_grad_vars)
-      for i, curr_var in enumerate(unscaled_grad_vars):
-        print(i, curr_var)
-        optimizer.apply_gradients([curr_var], global_step)
-      minimize_op = optimizer.apply_gradients(unscaled_grad_vars, global_step)
-    else:
-      minimize_op = optimizer.minimize(loss, global_step)
+    #if loss_scale != 1:
+    # When computing fp16 gradients, often intermediate tensor values are
+    # so small, they underflow to 0. To avoid this, we multiply the loss by
+    # loss_scale to make these tensor values loss_scale times bigger.
+    scaled_grad_vars = optimizer.compute_gradients(loss * loss_scale)
 
+    # Once the gradient computation is complete we can scale the gradients
+    # back to the correct scale before passing them to the optimizer.
+    unscaled_grad_vars = [(grad / loss_scale, var)
+                          for grad, var in scaled_grad_vars]
+    print('loss_scale', loss_scale)
+    # print(unscaled_grad_vars)
+    #for i, curr_var in enumerate(unscaled_grad_vars):
+      # print(i, curr_var)
+      #optimizer.apply_gradients([curr_var], global_step)
+    minimize_op = optimizer.apply_gradients(unscaled_grad_vars, global_step)
+    #else:
+    #  minimize_op = optimizer.minimize(loss, global_step)
+
+    # for regularized_bn, the gradient update ops are generated relative to the creation of the minimize_op
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    print('update_ops len', len(update_ops))
     train_op = tf.group(minimize_op, update_ops)
   else:
     train_op = None
 
   accuracy = tf.metrics.accuracy(labels, predictions['classes'])
-  metrics = {'accuracy': accuracy,
-             'cross_entropy': tf.metrics.mean(cross_entropy)}
+  eval_metrics = {'accuracy': accuracy,
+                  'cross_entropy': tf.metrics.mean(cross_entropy)}
 
   # Create a tensor named train_accuracy for logging purposes
-  tf.identity(accuracy[1], name='train_accuracy')
-  tf.summary.scalar('train_accuracy', accuracy[1])
+  train_accuracy = tf.identity(accuracy[1], name='train_accuracy')
+  tf.summary.scalar('train_accuracy', train_accuracy)
 
   return tf.estimator.EstimatorSpec(
       mode=mode,
       predictions=predictions,
       loss=loss,
       train_op=train_op,
-      eval_metric_ops=metrics)
+      eval_metric_ops=eval_metrics)
 
 
 def resnet_main(
@@ -378,6 +408,15 @@ def resnet_main(
           'loss_scale': flags_core.get_loss_scale(flags_obj),
           'dtype': flags_core.get_tf_dtype(flags_obj),
           'batch_norm_method': flags_obj.batch_norm_method,
+          'bfn_mmfwd': flags_obj.mmfwd,
+          'bfn_mmgrad': flags_obj.mmgrad,
+          'vd_weights': flags_obj.vd_weights,
+          'bfn_grad_clip': flags_obj.bfn_grad_clip,
+          'rvst': flags_obj.rvst,
+          'bfn_input_decay': flags_obj.bfn_input_decay,
+          'batch_denom': flags_obj.batch_denom,
+          'opt_mm': flags_obj.opt_mm,
+          'bepm': flags_obj.bepm,
       })
 
   run_params = {
@@ -385,9 +424,19 @@ def resnet_main(
       'dtype': flags_core.get_tf_dtype(flags_obj),
       'resnet_size': flags_obj.resnet_size,
       'resnet_version': flags_obj.resnet_version,
+      'loss_scale': flags_core.get_loss_scale(flags_obj),
       'synthetic_data': flags_obj.use_synthetic_data,
       'train_epochs': flags_obj.train_epochs,
       'batch_norm_method': flags_obj.batch_norm_method,
+      'bfn_mmfwd': flags_obj.mmfwd,
+      'bfn_mmgrad': flags_obj.mmgrad,
+      'vd_weights': flags_obj.vd_weights,
+      'bfn_grad_clip': flags_obj.bfn_grad_clip,
+      'rvst': flags_obj.rvst,
+      'bfn_input_decay': flags_obj.bfn_input_decay,
+      'batch_denom': flags_obj.batch_denom,
+      'opt_mm': flags_obj.opt_mm,
+      'bepm': flags_obj.bepm,
   }
   if flags_obj.use_synthetic_data:
     dataset_name = dataset_name + '-synthetic'
@@ -458,25 +507,49 @@ def define_resnet_flags(resnet_size_choices=None):
   flags.adopt_module_key_flags(flags_core)
 
   flags.DEFINE_enum(
-      name='resnet_version', short_name='rv', default='2',
-      enum_values=['1', '2'],
-      help=flags_core.help_wrap(
-          'Version of ResNet. (1 or 2) See README.md for details.'))
+    name='resnet_version', short_name='rv', default='2',
+    enum_values=['1', '2'],
+    help=flags_core.help_wrap(
+      'Version of ResNet. (1 or 2) See README.md for details.'))
 
+  #flags.DEFINE_enum(
+  #  name='batch_norm_method', short_name='bnmethod', default='tf_layers_regular',
+  #  enum_values=[
+  #    'tf_layers_regular', 'tf_layers_renorm', 'identity',
+  #    'batch_free_normalization_sigfunc',
+  #    'batch_free_normalization_sigconst',
+  #    'batch_free_normalization_sigfunc_compare_running_stats',
+  #    'batch_free_direct',
+  #    'bfn_like_regular',
+  #    ],
+  #  help=flags_core.help_wrap(
+  #    'batch norm method string'))
+  flags.DEFINE_string(name='batch_norm_method', short_name='bnmethod', default='tf_layers_regular', help='batch norm method string')
+  flags.DEFINE_float(
+    name='mmfwd', default=.99, help="bfn momentum for forward moments", lower_bound=0., upper_bound=1.)
+  flags.DEFINE_float(
+    name='mmgrad', default=.99, help="bfn momentum for grad moments", lower_bound=0., upper_bound=1.)
+  flags.DEFINE_float(
+    name='vd_weights', default=None, help="regularized bn: virtual data weights")
+  flags.DEFINE_float(
+    name='bfn_grad_clip', default=None, help="bfn gradient norm clipping (marginalizes away C)", lower_bound=1e-5)
+  flags.DEFINE_float(
+    "batch_denom", default=None, help="batch_denom in determining learning rate (was originally 128 for cifar or 256 for imagenet)")
+  flags.DEFINE_float(
+    "opt_mm", default=0.9, help="momentum optimizer momentum")
+  flags.DEFINE_float(
+    "bepm", default=1., help="Boundary epoch multiplier relative to default repo settings")
   flags.DEFINE_enum(
-      name='batch_norm_method', short_name='bnmethod', default='tf_layers_regular',
-      enum_values=[
-        'tf_layers_regular', 'tf_layers_renorm',
-        'batch_free_normalization',
-        'batch_free_normalization_compare_running_stats',
-        'batch_free_normalization_sigfunc',
-        'identity',
-        ],
-      help=flags_core.help_wrap(
-          'batch norm method string'))
+    "rvst", default=None, enum_values=[
+      'uniform_max1',
+      'uniform_near1',
+      'lognorm_max1',
+      'lognorm_near1',], help="random variance scaling type for bfn")
+  flags.DEFINE_float(
+    "bfn_input_decay", default=None, help="bfn_input_decay is l2 loss coefficient on activations that are being input into batch-free normalization")
   choice_kwargs = dict(
-      name='resnet_size', short_name='rs', default='50',
-      help=flags_core.help_wrap('The size of the ResNet model to use.'))
+    name='resnet_size', short_name='rs', default='50',
+    help=flags_core.help_wrap('The size of the ResNet model to use.'))
 
   if resnet_size_choices is None:
     flags.DEFINE_string(**choice_kwargs)
