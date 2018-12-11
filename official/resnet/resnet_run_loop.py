@@ -305,6 +305,8 @@ def resnet_model_fn(features, labels, mode, model_class,
       if 'variance' in rep_name:
         v_minlogabs = tf.reduce_min(tf.log(v_abs))
         tf.summary.scalar('.'.join(['minlogabs_variance/', rep_name]), v_minlogabs)
+        v_maxlogabs = tf.reduce_max(tf.log(v_abs))
+        tf.summary.scalar('.'.join(['maxlogabs_variance/', rep_name]), v_maxlogabs)
       elif 'ygrad' in rep_name:
         v_maxlogabs = tf.reduce_max(tf.log(v_abs))
         tf.summary.scalar('.'.join(['maxlogabs_ygrads/', rep_name]), v_maxlogabs)

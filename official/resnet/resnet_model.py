@@ -36,7 +36,7 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-
+import re
 _BATCH_NORM_DECAY = 0.997
 _BATCH_NORM_EPSILON = 1e-5
 _BATCH_NORM_DEFAULT_METHOD = 'tf_layers_regular'
@@ -57,6 +57,25 @@ def old_batch_norm(inputs, training, data_format):
       inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
       momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
       scale=True, training=training, fused=True)
+
+def baseline_fallback(scope, batch_norm_method):
+  # block_layer / block_fn / bn01
+  if 'fast' in batch_norm_method:
+    if 'bn0' not in scope or not re.match('.*/block_fn_002/.*', scope): 
+      return True
+  if 'block2' in batch_norm_method:
+    if not re.match('.*/block_fn_002/.*', scope): 
+      return True
+  return False
+
+def parse_lsqrn_Gr(batch_norm_method, C):
+    # regular lsqrn: *_G_r
+    # shared lsqrn:  *_G_i
+    _, c, I = batch_norm_method.split('_')
+    c, I = int(c), int(I)
+    G = C // c # c must divide C, due to reshape
+    r = c - I # ok to round here
+    return G, r
 
 def moment_normalize(x, axes, eps, **kwargs):
   u, v = tf.nn.moments(x, axes, keep_dims=True, **kwargs)
@@ -86,14 +105,53 @@ def batch_norm(inputs, training, data_format, batch_norm_dict=None):
     batch_norm_method = batch_norm_dict['batch_norm_method']
   print('batch_norm_method', batch_norm_method)
 
-  if batch_norm_method=='tf_layers_regular':
+  shape = tf.shape(inputs)
+  shape_list = inputs.get_shape().as_list()
+  C = shape_list[1] if data_format == 'channels_first' else shape_list[3]
+  def _baseline_bn():
     return tf.layers.batch_normalization(
       inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
       momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
       scale=True, training=training, fused=True,
       renorm=False)
-  if batch_norm_method.startswith('tf_sequence'):
-    shape = tf.shape(inputs)
+  if batch_norm_method=='tf_layers_regular' or batch_norm_method.startswith('sharedlsqrn'):
+    return _baseline_bn()
+  elif batch_norm_method.startswith('switch'):
+    scope = tf.get_variable_scope().name
+    if baseline_fallback(scope, batch_norm_method):
+      # block_fn name is 1-based / faster running time; use fast baseline only for 
+      print("Use baseline bn for {}".format(scope))
+      return _baseline_bn()
+    else:
+      import external.lsqr_normalization.lsqr_norm as lsqr_norm
+      switch_bn_treatment = 'lsqrn' if 'lsqrn' in batch_norm_method else 'base'
+      print("switch_bn_treatment: {}".format(switch_bn_treatment))
+      G, r = parse_lsqrn_Gr(batch_norm_method, C) if switch_bn_treatment == 'lsqrn' else [None, None]
+      switchnorm_val, _ = lsqr_norm.switch_normalization(
+        inputs, Gr = [G, r], training=training, momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, data_format=data_format,
+        bn_treatment=switch_bn_treatment)
+      return switchnorm_val
+  elif batch_norm_method.startswith('lsqrn'):
+    scope = tf.get_variable_scope().name
+    if baseline_fallback(scope, batch_norm_method):
+      # block_fn name is 1-based / faster running time; use fast baseline only for 
+      print("Use baseline bn for {}".format(scope))
+      return _baseline_bn()
+    # The first bn call of the second residual-block function in each major-block
+    if '-mHW' in batch_norm_method:
+      marginalize = 'HW'
+    elif '-mrBHW' in batch_norm_method:
+      marginalize = 'runBHW'
+    else:
+      marginalize = 'BHW'
+    print('marginalize str = {}'.format(marginalize))
+    G, r = parse_lsqrn_Gr(batch_norm_method, C)
+    import external.lsqr_normalization.lsqr_norm as lsqr_norm
+    inputs_lsqrn, helper_dict = lsqr_norm.lsqrn(inputs, Gr=[G, r], BHWC=None, 
+      name_dict=None, marginalize=marginalize,
+      training=training, momentum=_BATCH_NORM_DECAY, data_format=data_format, epsilon=_BATCH_NORM_EPSILON,)
+    return inputs_lsqrn
+  elif batch_norm_method.startswith('tf_sequence'):
     stshp = inputs.get_shape().as_list() # stshp stands for static shape; may contain Nones;
     for _ in stshp[1:]:
       assert _ is not None
@@ -103,10 +161,10 @@ def batch_norm(inputs, training, data_format, batch_norm_dict=None):
     one = tf.ones(shape=[], dtype=tf.int32)
     # CuDNN has constraints on batch size (dim 0) -- can't be too large -- hence different patterning for 0 and 1
     dict_reshape = {  # dim 1 is the accumulator dimension in tf.layers.batch_normalization
-      '0': tf.stack([shape[0],                                  one,                 shape[1], shape[2] * shape[3]]), # accumulate ...
-      '2': tf.stack([shape[0] * shape[1],                       shape[2],            one, shape[3]]),         # accumulate .H.
-      '3': tf.stack([shape[0] * shape[1],                       shape[2] * shape[3], one, one]),     # accumulate .HW
-      '6': tf.stack([shape[0],                                  shape[1] * shape[2], one, shape[3]]),         # accumulate CH.
+      '0': tf.stack([shape[0],             one,                 shape[1], shape[2] * shape[3]]), # accumulate ...
+      '2': tf.stack([shape[0] * shape[1],  shape[2],            one, shape[3]]),         # accumulate .H.
+      '3': tf.stack([shape[0] * shape[1],  shape[2] * shape[3], one, one]),     # accumulate .HW
+      '6': tf.stack([shape[0],             shape[1] * shape[2], one, shape[3]]),         # accumulate CH.
       # 4: C..  standard batch normalization
       # 1: ..W. batch size too large for cudnn to handle: special case  -- transpose into 2
       # 5: C.W  discontiguous accumulator dims: special case  -- transpose into 6
@@ -114,10 +172,10 @@ def batch_norm(inputs, training, data_format, batch_norm_dict=None):
     }
 
     dict_stshp = {  # dim 1 is the accumulator dimension in tf.layers.batch_normalization
-        '0': [None, 1,                   stshp[1], stshp[2] * stshp[3]],# accumulate ...
-        '2': [None, stshp[2],            1, stshp[3]],                  # accumulate .H.
-        '3': [None, stshp[2] * stshp[3], 1, 1],                         # accumulate .HW
-        '6': [None, stshp[1] * stshp[2], 1, stshp[3]]                   # accumulate CH.
+        '0': [None, 1,                   stshp[1], stshp[2] * stshp[3]], # accumulate ...
+        '2': [None, stshp[2],            1, stshp[3]],                   # accumulate .H.
+        '3': [None, stshp[2] * stshp[3], 1, 1],                          # accumulate .HW
+        '6': [None, stshp[1] * stshp[2], 1, stshp[3]]                    # accumulate CH.
         # 4: C..  standard batch normalization
         # 1,5; transpose into BCWC and reduce to 2,6 respectively. CuDNN batch size constraint; incontiguous accumulator rank indices  
         # 7: ...  cannot normalize.
@@ -416,6 +474,146 @@ def _building_block_v2(inputs, filters, training, projection_shortcut, strides,
   return inputs + shortcut
 
 
+
+def _shared_lsqrn_all_in_one(inputs, shortcut, training, batch_norm_method):
+  raise ValueError("stop using _shared_lsqrn_all_in_one")
+  import external.lsqr_normalization.lsqr_norm as lsqr_norm
+  _, [B, H, W, C] = lsqr_norm.as_BHWC(shortcut, data_format='channels_last')
+  _, c, I = batch_norm_method.split('_') # 
+  c, I = int(c), int(I)
+  del I #  ignore I
+  if '-use1g' in batch_norm_method:
+    G = 1 
+    explanatory_BHWGc = tf.reshape(shortcut[:, :, :, :c], [B, H, W, 1, c])
+    print('%s type: %s' % (batch_norm_method, '-use1g'))
+  else:
+    G = C // c
+    assert C == c * G # c = channels per group. ignore I
+    explanatory_BHWGc = tf.reshape(shortcut, [B, H, W, G, c])
+
+  marginalize, l2_regularizer = 'BHW', 1e-3
+  if '-mHW' in batch_norm_method:
+    marginalize = 'HW'
+    # marginalize, l2_regularizer = 'HW', 1e-1
+  if '-l2tr' in batch_norm_method:
+    mult_trace_to_l2_reg = 1e-2
+    # mult_trace_to_l2_reg, floor_trace_to_l2_reg = None, 1e-2
+  else:
+    mult_trace_to_l2_reg = None
+
+  pinv_BHWGc = lsqr_norm.get_pinv_BHWGi(explanatory_BHWGc, 
+    l2_regularizer=l2_regularizer, marginalize=marginalize, mult_trace_to_l2_reg=mult_trace_to_l2_reg)
+  z_BHWC, helper_dict = lsqr_norm.shared_lsqrn(
+    inputs, G=G, explanatory_pinv_BHWGi=pinv_BHWGc, BHWC=[B, H, W, C],
+    name_dict = None, training=training, momentum=_BATCH_NORM_DECAY, data_format='channels_last',
+    bn_residuals=True, center_bn_residuals=True, scale_bn_residuals=True,
+    marginalize=marginalize, mean_variance_path=False)
+  return z_BHWC
+
+
+def shared_lsqrn_bnmethod(inputs, shortcut, training, batch_norm_method):
+
+  _, c, I = batch_norm_method.split('_') # 
+  c, I = int(c), int(I)
+  
+  if '-l2tr' in batch_norm_method:
+    mult_trace_to_l2_reg = 1e-2
+  else:
+    mult_trace_to_l2_reg = None
+
+  if '-1g.per.HW.BHW' in batch_norm_method or '-fullgroup.per.HW.BHW' in batch_norm_method:
+    # half the channels use 1 group of HW marginalization; the other half use 1 group of BHW
+    use1g = '-1g.per.HW.BHW' in batch_norm_method
+    print('use1g {}'.format(use1g))
+    inputs0, inputs1 = tf.split(inputs, num_or_size_splits=2, axis=3)
+    shortcut0, shortcut1 = tf.split(shortcut, num_or_size_splits=2, axis=3)
+    with tf.variable_scope('marg_HW'):
+      out0 = _shared_lsqrn_wrap(inputs0, shortcut0, training, c, 
+          use1g=use1g, marginalize='BHW', mult_trace_to_l2_reg=mult_trace_to_l2_reg)
+    with tf.variable_scope('marg_BHW'):
+      out1 = _shared_lsqrn_wrap(inputs1, shortcut1, training, c, 
+          use1g=use1g, marginalize='HW', mult_trace_to_l2_reg=mult_trace_to_l2_reg)
+    return tf.concat([out0, out1], axis=3)
+  else:
+    use1g = '-use1g' in batch_norm_method
+    print('use1g {}'.format(use1g))
+    marginalize = 'BHW'
+    if '-mHW' in batch_norm_method:
+      marginalize = 'HW'
+    return _shared_lsqrn_wrap(inputs, shortcut, training, c, use1g, marginalize, mult_trace_to_l2_reg)
+
+
+def _shared_lsqrn_wrap(inputs, shortcut, training, i, use1g, marginalize, mult_trace_to_l2_reg):
+  import external.lsqr_normalization.lsqr_norm as lsqr_norm
+  _, [B, H, W, C] = lsqr_norm.as_BHWC(shortcut, data_format='channels_last')
+  print("C {}, i {}, marginalize {}".format(C, i, marginalize))
+
+  if use1g:
+    G = 1 
+    explanatory_BHWGi = tf.reshape(shortcut[:, :, :, :i], [B, H, W, 1, i])
+  else: # each group uses its own set of explanatory channels
+    c = i
+    G = C // c
+    assert C == i * G # c = channels per group. ignore I
+    explanatory_BHWGi = tf.reshape(shortcut, [B, H, W, G, i])
+
+  l2_regularizer = 1e-3
+
+  pinv_BHWGc = lsqr_norm.get_pinv_BHWGi(explanatory_BHWGi, 
+    l2_regularizer=l2_regularizer, marginalize=marginalize, mult_trace_to_l2_reg=mult_trace_to_l2_reg)
+  z_BHWC, helper_dict = lsqr_norm.shared_lsqrn(
+    inputs, G=G, explanatory_pinv_BHWGi=pinv_BHWGc, BHWC=[B, H, W, C],
+    name_dict = None, training=training, momentum=_BATCH_NORM_DECAY, data_format='channels_last',
+    bn_residuals=True, center_bn_residuals=True, scale_bn_residuals=True,
+    marginalize=marginalize, mean_variance_path=False)
+  return z_BHWC
+
+
+
+
+def _shared_lsqrn_building_block_v2(
+    inputs, filters, training, projection_shortcut, strides,
+    data_format, batch_norm_dict=None):
+  """
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  print('_shared_lsqrn_building_block_v2')
+  assert batch_norm_dict is not None
+  batch_norm_method = batch_norm_dict['batch_norm_method']
+  assert data_format == 'channels_last' # channels_first not supported
+  # import external.lsqr_normalization.lsqr_norm as lsqr_norm
+  # shape_list = inputs.get_shape().as_list()
+
+  shortcut = inputs
+  with tf.variable_scope('bn0'):
+    inputs = old_batch_norm(inputs, training, data_format)
+  inputs = tf.nn.relu(inputs)
+
+  # The projection shortcut should come after the first batch norm and ReLU
+  # since it performs a 1x1 convolution.
+  if projection_shortcut is not None:
+    with tf.variable_scope('proj0'):
+      shortcut = projection_shortcut(inputs)
+
+  with tf.variable_scope('conv1'):
+    inputs = conv2d_fixed_padding(
+      inputs=inputs, filters=filters, kernel_size=3, strides=strides,
+      data_format=data_format)
+  
+  with tf.variable_scope('bn-shared1'):
+    z_BHWC = shared_lsqrn_bnmethod(inputs, shortcut, training, batch_norm_method)
+
+  inputs = tf.nn.relu(z_BHWC)
+  with tf.variable_scope('conv2'):
+    inputs = conv2d_fixed_padding(
+      inputs=inputs, filters=filters, kernel_size=3, strides=1,
+      data_format=data_format)
+
+  return inputs + shortcut
+
+
+
 def _bottleneck_block_v1(inputs, filters, training, projection_shortcut,
                          strides, data_format, batch_norm_dict=None):
   """A single block for ResNet v1, with a bottleneck.
@@ -536,6 +734,54 @@ def _bottleneck_block_v2(inputs, filters, training, projection_shortcut,
   return inputs + shortcut
 
 
+def _shared_lsqrn_bottleneck_block_v2(
+    inputs, filters, training, projection_shortcut, strides,
+    data_format, batch_norm_dict=None):
+  """
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  print('_shared_lsqrn_bottleneck_block_v2')
+  assert batch_norm_dict is not None
+  batch_norm_method = batch_norm_dict['batch_norm_method']
+  assert data_format == 'channels_last' # channels_first not supported
+
+  shortcut = inputs
+  with tf.variable_scope('bottleblock_initial'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
+    inputs = tf.nn.relu(inputs)
+
+  # The projection shortcut should come after the first batch norm and ReLU
+  # since it performs a 1x1 convolution.
+  if projection_shortcut is not None:
+    shortcut = projection_shortcut(inputs)
+
+  with tf.variable_scope('bottleblock_conv1'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=filters, kernel_size=1, strides=1,
+        data_format=data_format)
+  with tf.variable_scope('bottleblock_bn1'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
+    inputs = tf.nn.relu(inputs)
+  with tf.variable_scope('bottleblock_conv2'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=filters, kernel_size=3, strides=strides,
+        data_format=data_format)
+
+  with tf.variable_scope('bottleblock_bn2'):
+    inputs = batch_norm(inputs, training, data_format, batch_norm_dict=batch_norm_dict)
+    inputs = tf.nn.relu(inputs)
+  with tf.variable_scope('bottleblock_conv3'):
+    inputs = conv2d_fixed_padding(
+        inputs=inputs, filters=4 * filters, kernel_size=1, strides=1,
+        data_format=data_format)
+
+  with tf.variable_scope('bn-shared-final'):
+    z_BHWC = shared_lsqrn_bnmethod(inputs, shortcut, training, batch_norm_method)
+
+  return z_BHWC + shortcut
+
+
 def block_layer(inputs, filters, bottleneck, block_fn, blocks, strides,
                 training, name, data_format, batch_norm_dict=None):
   """Creates one layer of blocks for the ResNet model.
@@ -637,12 +883,18 @@ class Model(object):
       if resnet_version == 1:
         self.block_fn = _bottleneck_block_v1
       else:
-        self.block_fn = _bottleneck_block_v2
+        if batch_norm_dict.get('batch_norm_method', '').startswith('sharedlsqrn'):
+          self.block_fn = _shared_lsqrn_bottleneck_block_v2
+        else:
+          self.block_fn = _bottleneck_block_v2
     else:
       if resnet_version == 1:
         self.block_fn = _building_block_v1
       else:
-        self.block_fn = _building_block_v2
+        if batch_norm_dict.get('batch_norm_method', '').startswith('sharedlsqrn'):
+          self.block_fn = _shared_lsqrn_building_block_v2
+        else:
+          self.block_fn = _building_block_v2
 
     if dtype not in ALLOWED_TYPES:
       raise ValueError('dtype must be one of: {}'.format(ALLOWED_TYPES))
